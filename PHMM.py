@@ -1,16 +1,22 @@
-import numpy as np
 import joblib
 import pandas
-import scipy
+import scipy.stats as ss
 import itertools
 import pickle
 import json
 from joblib import Parallel,delayed
 from tqdm import tqdm
-
-
+from scipy.stats import dirichlet
+import torch
+from torch.distributions import Dirichlet
+import numpy as np
+import time
 
 class PHMM:
+    """
+    Stands for Integrated Probabilistic Hidden Markov Model
+    Sample from a collapsed posterior whose latent states are integrated out
+    """
     def __init__(self,initial=None,transition=None,emission=None):
         '''
         initialize a PHMM class (PHMM: Probabilisitc HMM)
@@ -82,7 +88,7 @@ class PHMM:
 
     def fit(self,y,obsDim,latentDim,postNum,initInitial=None,initTransition=None,initEmission=None,initZ=None,
             initialPrior=None, transitionPrior=None, emissionPrior=None,
-            log=True,core=1):
+            log=True,core=1,transition_alpha = 10.0, transition_delta = 0.001):
         '''
         fit the model, get estimations
         :param y: incomplete observed sequences
@@ -96,8 +102,13 @@ class PHMM:
         :param postNum: posterior sample num
         :param log: if display the prog bar. True for displaying the prog bar
         :param core: if use multiprocessing
+        :param transition_alpha: alpha used in sampling the transition matrix
+        :param transition_epsilon: correcting term used in sampling the transition matrix
         :return: return nothing
         '''
+        # set some parameters in sampling
+        self.transition_alpha = transition_alpha
+        self.transition_delta = transition_delta
         # prior specification
         # if no hyper parameter on prior has been specified, use uniform
         if  (initialPrior is None):
@@ -116,6 +127,10 @@ class PHMM:
         self.obsDim=obsDim
         self.latentDim=latentDim
         self.y=y
+        # observation mask, 1 for observed, 0 for missing
+        self.obs_mask = ~np.isnan(self.y)
+        # observed indices for each sequence
+        self.obs_idx = [np.where(indicator)[0] for indicator in self.obs_mask]
         if initTransition is None:
             self.transition=np.random.dirichlet(np.ones(self.latentDim),self.latentDim)
         else:
@@ -140,6 +155,7 @@ class PHMM:
         self.vote=np.zeros((self.y.shape[0],self.y.shape[1],self.latentDim))
         # objective function
         self.objFunc=np.zeros(postNum)
+        start = time.time()
         # start running
         with Parallel(n_jobs=core, backend='loky', max_nbytes='1M') as parallel:
             for s in tqdm(range(postNum)):
@@ -150,8 +166,16 @@ class PHMM:
                 self.objFunc[s]=self.func
                 # record the voting of each latent site
                 # chatGPT told me this works, I don't know why, but it works nicely.
-                self.vote[np.arange(self.vote.shape[0]).reshape(-1, 1), np.arange(self.vote.shape[1]), self.z.astype(int)]+=1
-
+                # set nan values to 0, anyway they are not important
+                #print(f'A: {self.transition}')
+                #print(f'B: {self.emission}')
+                #print(f'initial: {self.initial}')
+                self.vote[np.arange(self.vote.shape[0]).reshape(-1, 1), np.arange(self.vote.shape[1]), np.nan_to_num(self.z, nan=0).astype(int)]+=1
+        end = time.time()
+        self.total_time = end - start
+        # AIC and BIC
+        self.AIC = -2 * self.objFunc + 2 * (self.initial.size + self.transition.size + self.emission.size)
+        self.BIC = -2 * self.objFunc + np.log(self.z.size) * (self.initial.size + self.transition.size + self.emission.size)
         # get estimated z and mean
         self.getMean()
         self.getZ()
@@ -159,7 +183,7 @@ class PHMM:
     def crossValidationScore(self,y,obsDim,latentDim,postNum,initInitial=None,initTransition=None,initEmission=None,initZ=None,
             initialPrior=None, transitionPrior=None, emissionPrior=None,
             log=True,core=1,
-            validationRef=None, predNum=1000,predCore=1,fraction=0.1,folds=10):
+            validationRef=None, predNum=1000,predCore=1,fraction=0.1,folds=10,drop='random'):
         '''
         perform k fold cross validation and report the acc on imputing missing values in obs sequences
         Procedure: random drop some observed entries and try to predict them using the fitted model
@@ -182,6 +206,7 @@ class PHMM:
         :param predCore: Number of cores used for prediction ( in cross validation )
         :param fraction: fraction of entries set to be missing in predictive evaluation
         :param validationRef: reference for mapping the training to the right position
+        :param drop: 'random':drop the observations randomly. 'forecast':drop the last fraction percent of data.
         :return: cross validated acc on imputing missing values in obs sequences
         '''
         if validationRef is None:
@@ -205,15 +230,21 @@ class PHMM:
 
             # get the indices of the observed entries in the test set
             mask = ~np.isnan(y_test)
-            # Get the indices of the non-zero elements (True values)
-            nonZeroIndices = np.argwhere(mask)
-            # Calculate the number of elements to set to 0 (False)
-            numElementsToZero = int(fraction * len(nonZeroIndices))
-            # Randomly select non-zero indices to set to 0
-            selectedIndices = nonZeroIndices[
-                np.random.choice(len(nonZeroIndices), numElementsToZero, replace=False)]
-            # Update the mask: set the selected indices to 0 (False)
-            mask[selectedIndices[:, 0], selectedIndices[:, 1]] = False
+            if drop=='forecast':
+                window= int(np.ceil(y_test.shape[1]*fraction))
+                # set all observations in window as missing
+                mask[:,-window:]=False
+            # if drop can't be specified, treat it as dropping randomly
+            else:
+                # Get the indices of the non-zero elements (True values)
+                nonZeroIndices = np.argwhere(mask)
+                # Calculate the number of elements to set to 0 (False)
+                numElementsToZero = int(fraction * len(nonZeroIndices))
+                # Randomly select non-zero indices to set to 0
+                selectedIndices = nonZeroIndices[
+                    np.random.choice(len(nonZeroIndices), numElementsToZero, replace=False)]
+                # Update the mask: set the selected indices to 0 (False)
+                mask[selectedIndices[:, 0], selectedIndices[:, 1]] = False
 
             # mask some observations in y test randomly and use this new masked version for evaluation
             masked_y_test=y_test.copy()
@@ -235,7 +266,7 @@ class PHMM:
         return np.array(scores)
 
 
-    def predict(self,y,postNum=1000,core=1):
+    def predict(self,y,postNum=1000,core=1,posterior = False):
         '''
         Predict according to new incomplete sequences y, return posterior predictive distribution
         :param y: incomplete sequences
@@ -258,6 +289,7 @@ class PHMM:
                 newY = np.zeros(y.shape)
                 # for each k, generate a mask
                 mask = np.array([newZ==k for k in range(self.latentDim)])
+                #print('emission matrix: ',self.emission)
                 newSample=np.array(
                     [np.random.choice(np.arange(self.obsDim), size=y.shape, p=self.emission[k]) for k in range(self.latentDim)])
                 # keep observed entries unchanged
@@ -273,9 +305,11 @@ class PHMM:
 
         predZ = np.argmax(zVote, axis=2)
         predY = np.argmax(yVote,axis=2)
-        return zVote,predZ, yVote, predY
-
-
+        # if to return the posterior sampling result
+        if posterior:
+            return zVote, yVote
+        else:
+            return predZ, predY
 
     def gibbsUpdate(self,parallel):
         '''
@@ -284,16 +318,16 @@ class PHMM:
         :return: return nothing
         '''
         # update chains
-        ff = parallel(delayed(self.forwardFilter)(self.y[t]) for t in range(self.y.shape[0]))
+        ff = parallel(delayed(self.forwardFilter)(self.y[t],self.obs_idx[t]) for t in range(self.y.shape[0]))
         ff = np.array(ff)
         # evaluate objective funcrtion
         self.func=np.log(np.sum(ff[:,-1,:]))
-        newZ=parallel(delayed(self.backwardSampler)(self.y[t],ff[t]) for t in range(self.y.shape[0]))
+        newZ=parallel(delayed(self.backwardSampler)(self.y[t],ff[t],self.obs_idx[t]) for t in range(self.y.shape[0]))
         self.z=np.array(newZ)
         # update parameters
         newInitial=self.initialSampler()
         self.initial=newInitial
-        newTransition=self.transitionSampler()
+        newTransition=self.transitionSampler(alpha = self.transition_alpha, delta = self.transition_delta)
         self.transition=newTransition
         newEmission=self.emissionSampler()
         self.emission=newEmission
@@ -309,26 +343,179 @@ class PHMM:
         start = self.z[:, 0]
         startNum = np.array([np.sum(start==i) for i in range(self.latentDim)])
         newInitial = np.random.dirichlet(self.initialPrior + startNum)
+        #print(newInitial)
         return newInitial
 
-    def transitionSampler(self):
+    def transitionSampler(self, alpha=0.1, delta=0.001):
+        """
+        Sample the transition matrix using a Metropolis-Hastings step on the simplex
+        for partially observed chains. Instead of using a Dirichlet proposal, we use a
+        random walk in the unconstrained (ALR-transformed) space. Each row gets its own scaling
+        factor, and that row-specific scale is adapted dynamically so that its acceptance rate
+        is approximately 0.234.
+
+        It is assumed that the following members are defined as class attributes
+        prior to or during the first call to this method:
+
+          - self.scaling: NumPy array (length latentDim) of initial noise scales for the random walk.
+          - self.total_acceptance: NumPy array (length latentDim) for accepted proposals.
+          - self.total_attempts: NumPy array (length latentDim) for proposal attempts.
+          - self.gamma: adaptation rate constant (suggested default is 0.1)
+          - self.target_accept: target acceptance rate for each row (default: 0.234)
+
+        :param alpha: initial scaling for each row (used for the first call)
+        :param delta: (unused here) retained for compatibility
+        :return: The updated transition matrix.
+        """
+
+        # Initialize class-level members if needed.
+        if not hasattr(self, 'scaling'):
+            self.scaling = np.full(self.latentDim, alpha, dtype=float)
+        if not hasattr(self, 'total_acceptance'):
+            self.total_acceptance = np.zeros(self.latentDim, dtype=float)
+        if not hasattr(self, 'total_attempts'):
+            self.total_attempts = np.zeros(self.latentDim, dtype=float)
+        if not hasattr(self, 'gamma'):
+            self.gamma = 0.1
+        if not hasattr(self, 'target_accept'):
+            self.target_accept = 0.234
+
+        newTransition = np.copy(self.transition)
+        accepted_count_total = 0  # for debug printing
+
+        # --- Helper functions for the ALR random walk proposal ---
+        def alr_transform(x, eps=1e-10):
+            """
+            Map a probability vector x on the simplex (length K) to R^(K-1)
+            using the additive log-ratio (ALR) transform.
+            (Uses the last component as the reference.)
+            """
+            x = np.clip(x, eps, None)
+            return np.log(x[:-1]) - np.log(x[-1])
+
+        def inverse_alr_transform(y):
+            """
+            Inverse of the ALR transform: maps a point y in R^(K-1)
+            back to a point x on the K-dimensional simplex.
+            """
+            exp_y = np.exp(y)
+            x = np.concatenate([exp_y, [1.0]])
+            return x / np.sum(x)
+
+        def jacobian_inverse_alr(y):
+            """
+            Compute the absolute determinant of the Jacobian for the inverse ALR transform.
+
+            For the ALR transformation:
+              y_i = log(x_i) - log(x_K),  i = 1,...,K-1,
+            the inverse is:
+              x_i = exp(y_i) / (1 + sum(exp(y)))   for i=1,...,K-1, and
+              x_K = 1 / (1 + sum(exp(y))).
+            The Jacobian determinant is given by:
+              |J| = (∏ exp(y_i)) / (1 + sum(exp(y)))^K,
+            where K = len(y) + 1.
+            """
+            exp_y = np.exp(y)
+            K = len(y) + 1
+            return np.prod(exp_y) / ((1 + np.sum(exp_y)) ** K)
+
+        # --- Likelihood and Prior functions (unchanged from the original code) ---
+        def compute_likelihood(trans_matrix):
+            # Get dimensions: n_chains x T (observations per chain)
+            n_chains, T = self.z.shape
+
+            # Boolean mask for observed (non-NaN) entries.
+            observed_mask = ~np.isnan(self.z)
+
+            # Valid consecutive observed pairs.
+            valid_pairs_mask = observed_mask[:, :-1] & observed_mask[:, 1:]
+            if not np.any(valid_pairs_mask):
+                return 0.0
+
+            start_states = self.z[:, :-1][valid_pairs_mask].astype(int)
+            end_states = self.z[:, 1:][valid_pairs_mask].astype(int)
+
+            time_indices = np.arange(T)
+            start_times = time_indices[:-1].reshape(1, -1).repeat(n_chains, axis=0)[valid_pairs_mask]
+            end_times = time_indices[1:].reshape(1, -1).repeat(n_chains, axis=0)[valid_pairs_mask]
+            gaps = end_times - start_times
+
+            unique_gaps = np.unique(gaps)
+            gap_powers = {gap: np.linalg.matrix_power(trans_matrix, gap) for gap in unique_gaps}
+
+            log_lik = 0.0
+            for gap in unique_gaps:
+                gap_mask = (gaps == gap)
+                if np.any(gap_mask):
+                    power_mat = gap_powers[gap]
+                    log_lik += np.sum(np.log(power_mat[start_states[gap_mask], end_states[gap_mask]] + 1e-300))
+            return log_lik
+
+        def compute_prior(row, prior):
+            return dirichlet.logpdf(row, prior)
+
+        # --- MH update for each row of the transition matrix ---
+        for j in range(self.latentDim):
+            current_row = newTransition[j, :]
+
+            # Use the row-specific scaling factor.
+            scale_j = self.scaling[j]
+
+            # --- Random Walk Proposal in ALR space ---
+            y_current = alr_transform(current_row)
+            y_proposed = y_current + np.random.normal(0, scale_j, size=y_current.shape)
+            proposed_row = inverse_alr_transform(y_proposed)
+
+            jac_current = jacobian_inverse_alr(y_current)
+            jac_proposed = jacobian_inverse_alr(y_proposed)
+
+            # --- Compute likelihoods and priors ---
+            current_loglik = compute_likelihood(newTransition)
+            current_logprior = compute_prior(current_row, self.transitionPrior[j])
+            temp_trans = np.copy(newTransition)
+            temp_trans[j, :] = proposed_row
+            proposed_loglik = compute_likelihood(temp_trans)
+            proposed_logprior = compute_prior(proposed_row, self.transitionPrior[j])
+
+            # --- Acceptance Ratio with Jacobian Correction ---
+            log_ratio = (proposed_loglik + proposed_logprior + np.log(jac_proposed)) - \
+                        (current_loglik + current_logprior + np.log(jac_current))
+
+            if np.log(np.random.random()) < log_ratio:
+                newTransition[j, :] = proposed_row
+                accepted = True
+                accepted_count_total += 1
+            else:
+                accepted = False
+
+            # --- Update row-specific cumulative counters ---
+            self.total_attempts[j] += 1
+            if accepted:
+                self.total_acceptance[j] += 1
+
+            # Compute row-specific acceptance rate and adapt the scaling factor.
+            acc_rate_j = self.total_acceptance[j] / self.total_attempts[j]
+            self.scaling[j] *= np.exp(self.gamma * (acc_rate_j - self.target_accept))
+
+        # --- Optional global debug output ---
+        global_attempts = np.sum(self.total_attempts)
+        global_acceptance = np.sum(self.total_acceptance)
+        global_accept_rate = global_acceptance / global_attempts if global_attempts > 0 else 0.0
+
         '''
-        sample transition matrix
-        WARNING: Private Function, not exposed to users!
-        :return: return the sampled transition
+        print(f"Accepted in this call: {accepted_count_total} out of {self.latentDim} rows")
+        print(f"Cumulative acceptance (per row):")
+        for j in range(self.latentDim):
+            print(f"  Row {j}: {self.total_acceptance[j]:.1f}/{self.total_attempts[j]:.1f} "
+                  f"(rate = {self.total_acceptance[j] / self.total_attempts[j]:.3f}), scaling = {self.scaling[j]:.3f}")
+        print(f"Global acceptance: {global_acceptance:.1f}/{global_attempts:.1f} ({global_accept_rate:.3f})")
+        print(f"Updated transition matrix:\n{self.transition}")
         '''
-        self.latentDim=len(self.initial)
-        newTransition = np.zeros((self.latentDim, self.latentDim))
-        for j in range(0, newTransition.shape[0]):
-            count_of_change = np.zeros(newTransition.shape[1])
-            for k in range(0,newTransition.shape[1]):
-                # search the pattern of transition from j to k
-                search_pattern = [j, k]
-                table = (self.z[:, :-1] == search_pattern[0]) & (self.z[:, 1:] == search_pattern[1])
-                count_of_change[k] = np.sum(table)
-            # Generate dirichlet distribution
-            dist = np.random.dirichlet((self.transitionPrior[j] + np.array(count_of_change)))
-            newTransition[j, :] = dist
+        #print(f'transition: {self.transition}')
+
+        # Update the model's transition matrix, then return.
+        self.transition = newTransition
+
         return newTransition
 
     def emissionSampler(self):
@@ -350,7 +537,7 @@ class PHMM:
             newEmission[j, :] = np.random.dirichlet(self.emissionPrior[j] + obsFreq, 1)[0]
         return newEmission
 
-    def forwardFilter(self,y):
+    def forwardFilter(self,y,obs_idx):
         '''
         calculate the forward probability given a single sequence y
         WARNING: Private Function, not exposed to users!
@@ -358,57 +545,95 @@ class PHMM:
         :return: return a length-n array standing for the observed prob
         '''
         # indicator on each site's missingness, 1 for observed and 0 for missing
-        indicator = ~np.isnan(y)
-
-        # length of the whole sequence
+        #indicator = ~np.isnan(y)
+        obs_idx = obs_idx
         T = len(y)
-        self.latentDim=len(self.initial)
-        self.obsDim=self.emission.shape[1]
 
-        # start to compute alpha recursively
+        if len(obs_idx) == 0:
+            return np.zeros((T, self.latentDim))
+
+        # Initialize alpha matrix (all zeros)
         alpha = np.zeros((T, self.latentDim))
-        # calculate the first entry of alpha
-        if indicator[0]:
-            # the first entry observed
+
+        # Handle first observed position
+        first_obs_idx = obs_idx[0]
+        if first_obs_idx == 0:
             alpha[0] = self.initial * self.emission[:, int(y[0])]
         else:
-            # first entry missing
+            # If first observation isn't at t=0, need to propagate initial distribution
+            power_matrix = np.linalg.matrix_power(self.transition, first_obs_idx)
+            alpha[first_obs_idx] = np.dot(self.initial, power_matrix) * self.emission[:, int(y[first_obs_idx])]
             alpha[0] = self.initial
-        for i in range(1, T):
-            # corresponds to the case that y_i is observable
-            if indicator[i]:
-                alpha[i, :] = np.dot(alpha[i - 1, :], self.transition) * self.emission[:, int(y[i])]
+
+        # Process subsequent observations
+        for i in range(1, len(obs_idx)):
+            curr_idx = obs_idx[i]
+            prev_idx = obs_idx[i - 1]
+            gap = curr_idx - prev_idx
+
+            # Compute transition over gap
+            if gap == 1:
+                trans_matrix = self.transition
             else:
-                alpha[i, :] = np.dot(alpha[i - 1, :], self.transition)
+                trans_matrix = np.linalg.matrix_power(self.transition, gap)
+
+            # Update alpha
+            alpha[curr_idx] = np.dot(alpha[prev_idx], trans_matrix) * self.emission[:, int(y[curr_idx])]
 
         return alpha
 
-
-    def backwardSampler(self,y,alpha):
+    def backwardSampler(self, y, alpha, obs_idx):
         '''
         backward sampling based on observation y and its forward probability alpha
         WARNING: Private Function, not exposed to users!
         :param y: observed sequence
         :param alpha: forward probability
+        :param obs_idx: indices of observed positions
         :return: sampled latent sequence
         '''
         # initialize the output
-        latentSequence = np.zeros(len(y))
-        T=len(y)
-        self.latentDim=len(self.initial)
-        self.obsDim=self.emission.shape[1]
+        T = len(y)
+        self.latentDim = len(self.initial)
+        self.obsDim = self.emission.shape[1]
+        latentSequence = np.full(T, np.nan)
 
-        # First sample the last latent state
-        w = alpha[T - 1, :] / np.sum(alpha[T - 1, :])
-        latentSequence[T-1]=np.random.choice(self.latentDim,1,p=w)
+        if len(obs_idx) == 0:
+            # If no observations, only sample initial state
+            latentSequence[0] = np.random.choice(self.latentDim, 1, p=self.initial)
+            return latentSequence
 
-        # Then sample each latent state in sequence
-        for t in range(T-2, -1, -1):
-            # compute the index of hidden state z_{t+1}
-            next = latentSequence[t+1]
-            w = self.transition[:, int(next)] * alpha[t, :]
-            w = w/np.sum(w)
-            latentSequence[t]=np.random.choice(self.latentDim,1,p=w)
+        # Sample the last observed state
+        last_obs_idx = obs_idx[-1]
+        w = alpha[last_obs_idx, :] / np.sum(alpha[last_obs_idx, :])
+        latentSequence[last_obs_idx] = np.random.choice(self.latentDim, 1, p=w)
+
+        # Backward sample through observed positions
+        for i in range(len(obs_idx) - 2, -1, -1):
+            curr_idx = obs_idx[i]
+            next_idx = obs_idx[i + 1]
+            gap = next_idx - curr_idx
+
+            # Compute transition over gap
+            if gap == 1:
+                trans_matrix = self.transition
+            else:
+                trans_matrix = np.linalg.matrix_power(self.transition, gap)
+
+            # Sample state
+            next_state = latentSequence[next_idx]
+            w = trans_matrix[:, int(next_state)] * alpha[curr_idx, :]
+            w = w / np.sum(w)
+            latentSequence[curr_idx] = np.random.choice(self.latentDim, 1, p=w)
+
+        # If first observation isn't at t=0, sample initial state
+        if obs_idx[0] != 0:
+            first_obs_idx = obs_idx[0]
+            first_state = latentSequence[first_obs_idx]
+            power_matrix = np.linalg.matrix_power(self.transition, first_obs_idx)
+            w = power_matrix[:, int(first_state)] * alpha[0, :]
+            w = w / np.sum(w)
+            latentSequence[0] = np.random.choice(self.latentDim, 1, p=w)
+
         return latentSequence
 
     def getZ(self):
@@ -517,13 +742,102 @@ class PHMM:
         self.getMean()
         self.getZ()
         self.acc= np.sum(np.equal(self.zHat,trueZ))/np.size(self.zHat)
+        self.initialErrorStd = np.std(np.square(self.initialMean-trueInitial))
         self.initialError=np.mean(np.square(self.initialMean-trueInitial))
         self.transitionError=np.mean(np.square(self.transitionMean-trueTransition))
+        self.transitionErrorStd = np.std(np.square(self.transitionMean-trueTransition))
         self.emissionError=np.mean(np.square(self.emissionMean-trueEmission))
-        # AIC and BIC
-        self.AIC=-2*self.objFunc + 2*(self.initial.size + self.transition.size + self.emission.size)
-        self.BIC=-2*self.objFunc + np.log(self.z.size)*(self.initial.size + self.transition.size + self.emission.size)
-        return self.acc, self.initialError, self.transitionError, self.emissionError
+        self.emissionErrorStd = np.std(np.square(self.emissionMean-trueEmission))
+        return self.acc, self.initialError, self.transitionError, self.emissionError, self.initialErrorStd, self.transitionErrorStd, self.emissionErrorStd
+
+    def trivialImputer(self,y,method='mode'):
+        '''
+        Impute y using trivial methods
+        :param y: incomplete sequences
+        :param method: Imputing methods. 'mode': Impute with modes. 'forward':Impute forwardly. 'backward': impute backwardly.
+        'random': random imputing
+        :return:
+        '''
+        if method=='forward':
+            # Forward imputation
+            matrix = np.nan_to_num(y, nan=np.nan, copy=True)
+            matrix = np.roll(matrix, shift=1, axis=1)
+            matrix[:, 0] = np.nan_to_num(matrix[:, 0], nan=np.nan, copy=True)
+            matrix[:, 0] = np.roll(matrix[:, 0], shift=1, axis=0)
+            matrix[:, 0][np.isnan(matrix[:, 0])] = 0
+        elif method=='backward':
+            # Backward imputation
+            matrix = np.nan_to_num(y, nan=np.nan, copy=True)
+            matrix = np.roll(matrix, shift=-1, axis=1)
+            matrix[:, -1] = np.nan_to_num(matrix[:, -1], nan=np.nan, copy=True)
+            matrix[:, -1] = np.roll(matrix[:, -1], shift=-1, axis=0)
+            matrix[:, -1][np.isnan(matrix[:, -1])] = 0
+        elif method=='mode':
+            # Mode imputation
+            matrix = y.copy()
+            # Calculate modes for each row and store them in a new array
+            row_modes = np.array(
+                [ss.mode(row[~np.isnan(row)])[0][0] if not np.all(np.isnan(row)) else np.nan for row in
+                 matrix])
+
+            # Create a mask for missing entries
+            missing_mask = np.isnan(matrix)
+
+            # Create a broadcasted version of the row modes
+            row_modes_broadcasted = np.broadcast_to(row_modes[:, np.newaxis], matrix.shape)
+
+            # Fill missing entries with the modes using the mask
+            matrix[missing_mask] = row_modes_broadcasted[missing_mask]
+        else:
+            # random imputation if can't identify the method variable
+            # Create a copy of the matrix to avoid modifying the original
+            matrix = np.copy(y)
+
+            # Create a mask of observed entries
+            mask = ~np.isnan(matrix)
+
+            # Randomly sample values from observed entries for missing entries
+            matrix[np.isnan(matrix)] = np.random.choice(matrix[mask], size=np.isnan(matrix).sum())
+        return matrix
+
+    def trivialImputerEvaluation(self,y,drop='random',fraction=0.1):
+        '''
+        evaluate trivial imputers by dropping some observations and try to predict them
+        :param y: data
+        :param drop: dropping method. similar to crossValidationScore(), drop randomly by 'random' and drop last by 'forecast'
+        :param fraction: percent of dropping
+        :return: score of forward imputer, backward imputer, mode imputer and random imputer
+        '''
+        # get the indices of the observed entries in the test set
+        mask = ~np.isnan(y)
+        if drop == 'forecast':
+            window = int(np.ceil(y.shape[1] * fraction))
+            # set all observations in window as missing
+            mask[:, -window:] = False
+        # if drop can't be specified, treat it as dropping randomly
+        else:
+            # Get the indices of the non-zero elements (True values)
+            nonZeroIndices = np.argwhere(mask)
+            # Calculate the number of elements to set to 0 (False)
+            numElementsToZero = int(fraction * len(nonZeroIndices))
+            # Randomly select non-zero indices to set to 0
+            selectedIndices = nonZeroIndices[
+                np.random.choice(len(nonZeroIndices), numElementsToZero, replace=False)]
+            # Update the mask: set the selected indices to 0 (False)
+            mask[selectedIndices[:, 0], selectedIndices[:, 1]] = False
+        # start imputing
+        methods = ['mode', 'forward', 'backward', 'random']
+        scores = {}
+        # mask some observations in y according to mask and use this new masked version for evaluation
+        masked_y_test = y.copy()
+        masked_y_test[mask] = np.nan
+
+        for i in range(len(methods)):
+            method = methods[i]
+            y_pred = self.trivialImputer(masked_y_test, method=method)
+            score = np.sum(np.equal(y, y_pred) * mask) / np.sum(mask)
+            scores[method]=score
+        return scores
 
     def summarize(self):
         self.getMean()
@@ -533,6 +847,124 @@ class PHMM:
         self.initialVar = np.var(self.postInitial[-postNum:], axis=0)
         self.transitionVar = np.var(self.postTransition[-postNum:], axis=0)
         self.emissionVar = np.var(self.postEmission[-postNum:], axis=0)
+
+
+    def evaluateESS(self):
+        """
+        Evaluate the performance of the MCMC sampler using stored posterior samples.
+
+        Computes and returns:
+          1. Time per 1000 iterations.
+          2. Effective Sample Size (ESS) per iteration for each component in each set of parameters.
+          3. ESS per second for each component in each set of parameters.
+
+        Posterior samples are expected to be stored in:
+          - self.postInitial   (shape: T x init_dim)
+          - self.postTransition (shape: T x transition_shape...)
+          - self.postEmission   (shape: T x emission_shape...)
+
+        :param total_run_time: Total time in seconds for the T iterations.
+        :return: A dictionary containing evaluation metrics for each parameter set.
+                 Example structure:
+                 {
+                   "time_per_1000": float,
+                   "Initial": {
+                         "abs_ess": numpy.array,
+                         "ess_per_iter": numpy.array,
+                         "ess_per_sec": numpy.array,
+                         "summary": {"min": float, "median": float, "max": float}
+                   },
+                   "Transition": { ... },
+                   "Emission": { ... }
+                 }
+        """
+        # Total number of MCMC iterations.
+        total_run_time = self.total_time
+        T = self.postInitial.shape[0]
+        time_per_1000 = (total_run_time / T) * 1000
+
+        #####################
+        # Helper functions. #
+        #####################
+
+        def compute_autocorrelation(x):
+            """
+            Compute the autocorrelation function for a 1D array x.
+
+            Returns an array of autocorrelations for lags 0,1,2,...,len(x)-1.
+            """
+            n = len(x)
+            x = np.asarray(x)
+            x = x - np.mean(x)
+            # Full autocorrelation (only nonnegative lags).
+            result = np.correlate(x, x, mode='full')[n - 1:]
+            result = result / np.arange(n, 0, -1)
+            # Normalize by lag-0.
+            if result[0] == 0:
+                return np.zeros_like(result)
+            return result / result[0]
+
+        def ess_1d(x):
+            """
+            Compute the effective sample size (ESS) for a 1D chain x.
+
+            Uses the initial monotone sequence estimator: sums consecutive pairs
+            of autocorrelations until a pair becomes negative.
+            """
+            T_local = len(x)
+            acf = compute_autocorrelation(x)
+            sum_r = 0.0
+            # Sum pairs of autocorrelations: (lag1 + lag2), (lag3 + lag4), ...
+            for lag in range(1, T_local - 1, 2):
+                pair_sum = acf[lag] + acf[lag + 1]
+                if pair_sum < 0:
+                    break
+                sum_r += pair_sum
+            # Guard against degenerate cases.
+            if (1 + 2 * sum_r) <= 0:
+                return T_local
+            return T_local / (1 + 2 * sum_r)
+
+        def compute_ess_metrics(samples):
+            """
+            Compute ESS metrics for each component of the samples.
+
+            samples: array-like with shape (iterations, parameter_shape...)
+
+            Returns a dictionary with:
+              - "abs_ess": ESS for each component (absolute numbers).
+              - "ess_per_iter": ESS per iteration.
+              - "ess_per_sec": ESS per second.
+              - "summary": summary statistics (min, median, max) of the ESS.
+            """
+            # Compute ESS along the first axis (iterations) for each component.
+            abs_ess = np.apply_along_axis(ess_1d, 0, samples)
+            ess_per_iter = abs_ess / T
+            ess_per_sec = abs_ess / total_run_time
+            summary = {
+                "min": float(np.min(abs_ess)),
+                "median": float(np.median(abs_ess)),
+                "max": float(np.max(abs_ess))
+            }
+            return {
+                "abs_ess": abs_ess,
+                "ess_per_iter": ess_per_iter,
+                "ess_per_sec": ess_per_sec,
+                "summary": summary
+            }
+
+        #########################
+        # Compute the metrics.  #
+        #########################
+        results = {}
+        results["time_per_1000"] = time_per_1000
+
+        # Compute ESS metrics for each set of parameters.
+        results["Initial"] = compute_ess_metrics(self.postInitial)
+        results["Transition"] = compute_ess_metrics(self.postTransition)
+        results["Emission"] = compute_ess_metrics(self.postEmission)
+
+        return results
 
     def saveModel(self, modelName):
         '''

@@ -33,7 +33,7 @@ The PHMM.PHMM() method initializes a PHMM model object with specified initial, t
 Notice that the generated sequences are fully observed. If the user wants to generate incomplete observations, he/she should generate the mask matrix manually.
 
 ## Inference I: Training & Prediction
-The training interface of the package follows the convention in sklearn.
+The training interface of the package follows the convention in sklearn. That is, we can directly call a model to initialize it, and then use `train()` to perform training and `predict()` to perform prediction.
 
 ```py
 import PHMM
